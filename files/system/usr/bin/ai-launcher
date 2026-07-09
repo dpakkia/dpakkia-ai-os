@@ -5,4 +5,4 @@ prompt="$(printf "" | fuzzel --dmenu --prompt "AI > " --width 80)"
 
 [ -z "${prompt}" ] && exit 0
 
-/usr/local/bin/ai-agent "$prompt"
+/usr/bin/ai-agent "$prompt"
