@@ -1,0 +1,33 @@
+name: Build dpakkia-ai-os
+
+on:
+  schedule:
+    - cron: "00 06 * * *"
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  bluebuild:
+    name: Build custom image
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build image
+        uses: blue-build/github-action@v1
+        with:
+          recipe: recipes/recipe.yml
+          registry: ghcr.io
+          registry_namespace: ${{ github.repository_owner }}
+          registry_token: ${{ github.token }}
+          cosign_private_key: ${{ secrets.SIGNING_SECRET }}
+          cosign_password: ${{ secrets.SIGNING_PASSWORD }}

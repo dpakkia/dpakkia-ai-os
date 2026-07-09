@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+prompt="$(printf "" | fuzzel --dmenu --prompt "AI > " --width 80)"
+
+[ -z "${prompt}" ] && exit 0
+
+/usr/local/bin/ai-agent "$prompt"

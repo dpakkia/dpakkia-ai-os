@@ -1,0 +1,52 @@
+# yaml-language-server: $schema=https://schema.blue-build.org/recipe-v1.json
+
+name: dpakkia-ai-os
+description: Minimal immutable Sway desktop controlled by a local LLM agent
+
+base-image: ghcr.io/wayblueorg/sway
+image-version: latest
+
+modules:
+  - type: dnf
+    install:
+      packages:
+        - bash
+        - curl
+        - jq
+        - git
+        - nano
+        - htop
+        - fastfetch
+
+        - foot
+        - fuzzel
+        - waybar
+        - wl-clipboard
+        - grim
+        - slurp
+        - playerctl
+        - ydotool
+
+        - pipewire-utils
+        - wireplumber
+        - ffmpeg
+
+        - python3
+        - python3-pip
+        - python3-requests
+
+        - firefox
+
+        - distrobox
+        - podman
+
+  - type: files
+    files:
+      - source: system
+        destination: /
+
+  - type: systemd
+    system:
+      enabled:
+        - sddm.service
+        - ydotool.service
