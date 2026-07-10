@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-prompt="$(printf "" | fuzzel --dmenu --prompt "AI > " --width 80)"
+prompt="$(printf "" | fuzzel --dmenu --prompt "AI > " --width 90)"
 
 [ -z "${prompt}" ] && exit 0
 
-/usr/bin/ai-agent "$prompt"
+if output="$(/usr/bin/ai-agent "$prompt" 2>&1)"; then
+  [ -n "$output" ] && notify-send "AI" "$output" 2>/dev/null || true
+else
+  notify-send "AI error" "$output" 2>/dev/null || true
+  echo "$output" >&2
+  exit 1
+fi

@@ -36,7 +36,8 @@ modules:
         - python3-requests
 
         - firefox
-
+        - libnotify
+        - mako
         - distrobox
         - podman
 

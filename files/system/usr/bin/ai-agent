@@ -1,42 +1,159 @@
 #!/usr/bin/env python3
 
 import json
+import os
+import re
+import shutil
+import signal
 import subprocess
 import sys
+import time
 import urllib.parse
+from pathlib import Path
+
 import requests
 
-OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
-MODEL = "qwen3:1.7b"
+OLLAMA_BASE = os.environ.get("AI_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+MODEL = os.environ.get("AI_MODEL", "llama3.2:1b")
+CONTAINER_NAME = os.environ.get("AI_OLLAMA_CONTAINER", "dpakkia-ollama")
 
-ACTIONS = {
-    "open_app",
-    "web_search",
-    "open_url",
-    "screenshot",
-    "start_audio_recording",
-    "stop_audio_recording",
-    "set_volume",
+RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
+RECORD_PID = RUNTIME_DIR / "ai-audio-recording.pid"
+RECORD_DIR = Path.home() / "Recordings"
+
+ALLOWED_APPS = {
+    "firefox": ["firefox"],
+    "browser": ["firefox"],
+    "terminale": ["foot"],
+    "terminal": ["foot"],
+    "foot": ["foot"],
 }
 
 SYSTEM_PROMPT = """
-Sei un interprete di comandi desktop Linux.
-Rispondi SOLO con JSON valido.
+Sei il parser di comandi per un desktop Linux Sway.
+Devi rispondere SOLO con un oggetto JSON valido.
+Non usare Markdown.
+Non generare comandi shell.
 
 Azioni disponibili:
-- open_app: {"action":"open_app","app":"firefox"}
-- web_search: {"action":"web_search","query":"ricetta della lasagna"}
-- open_url: {"action":"open_url","url":"https://example.com"}
-- screenshot: {"action":"screenshot"}
-- start_audio_recording: {"action":"start_audio_recording"}
-- stop_audio_recording: {"action":"stop_audio_recording"}
-- set_volume: {"action":"set_volume","level":50}
 
-Non generare comandi shell.
-Non inventare azioni.
+1. Aprire app:
+{"action":"open_app","app":"firefox"}
+{"action":"open_app","app":"terminal"}
+
+2. Cercare sul web:
+{"action":"web_search","query":"ricetta della lasagna"}
+
+3. Aprire URL:
+{"action":"open_url","url":"https://example.com"}
+
+4. Screenshot:
+{"action":"screenshot","mode":"area"}
+{"action":"screenshot","mode":"full"}
+
+5. Volume:
+{"action":"set_volume","level":50}
+
+6. Registrazione audio:
+{"action":"start_audio_recording"}
+{"action":"stop_audio_recording"}
+
+Regole:
+- Se l'utente dice "cerca", "googla", "trova su internet", usa web_search.
+- Se l'utente dice "screenshot", "schermata", "cattura schermo", usa screenshot.
+- Se l'utente dice "apri firefox", usa open_app.
+- Se l'utente chiede di registrare audio, usa start_audio_recording.
+- Se l'utente chiede di fermare la registrazione, usa stop_audio_recording.
+- Se non sei sicuro, scegli l'azione più conservativa.
 """
 
-def call_ollama(user_prompt: str) -> dict:
+def notify(title: str, body: str) -> None:
+    if shutil.which("notify-send"):
+        subprocess.run(["notify-send", title, body], check=False)
+
+def run_detached(cmd: list[str]) -> None:
+    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def ollama_ready() -> bool:
+    try:
+        r = requests.get(f"{OLLAMA_BASE}/api/tags", timeout=2)
+        return r.ok
+    except Exception:
+        return False
+
+def start_ollama_container() -> None:
+    if ollama_ready():
+        return
+
+    if not shutil.which("podman"):
+        raise RuntimeError("Podman non è installato, impossibile avviare Ollama container.")
+
+    existing = subprocess.run(
+        ["podman", "ps", "-a", "--format", "{{.Names}}"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    ).stdout.splitlines()
+
+    if CONTAINER_NAME in existing:
+        subprocess.run(["podman", "start", CONTAINER_NAME], check=False)
+    else:
+        notify("AI", "Avvio container Ollama. Il primo avvio può richiedere tempo.")
+        subprocess.run([
+            "podman", "run", "-d",
+            "--name", CONTAINER_NAME,
+            "-p", "127.0.0.1:11434:11434",
+            "-v", "ollama:/root/.ollama",
+            "docker.io/ollama/ollama:latest"
+        ], check=True)
+
+    for _ in range(60):
+        if ollama_ready():
+            return
+        time.sleep(1)
+
+    raise RuntimeError("Ollama non risponde su 127.0.0.1:11434.")
+
+def installed_models() -> set[str]:
+    r = requests.get(f"{OLLAMA_BASE}/api/tags", timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    return {m.get("name", "") for m in data.get("models", [])}
+
+def ensure_model() -> None:
+    models = installed_models()
+    if MODEL in models:
+        return
+
+    notify("AI", f"Scarico modello {MODEL}. Può richiedere alcuni minuti.")
+    r = requests.post(
+        f"{OLLAMA_BASE}/api/pull",
+        json={"name": MODEL, "stream": False},
+        timeout=1800,
+    )
+    r.raise_for_status()
+    notify("AI", f"Modello {MODEL} pronto.")
+
+def extract_json(text: str) -> dict:
+    text = text.strip()
+
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?", "", text).strip()
+        text = re.sub(r"```$", "", text).strip()
+
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start == -1 or end == -1 or end <= start:
+        raise RuntimeError(f"Risposta non JSON dal modello: {text}")
+
+    return json.loads(text[start:end + 1])
+
+def call_llm(user_prompt: str) -> dict:
+    start_ollama_container()
+    ensure_model()
+
     payload = {
         "model": MODEL,
         "prompt": SYSTEM_PROMPT + "\nComando utente: " + user_prompt,
@@ -47,82 +164,133 @@ def call_ollama(user_prompt: str) -> dict:
         }
     }
 
-    r = requests.post(OLLAMA_URL, json=payload, timeout=60)
+    r = requests.post(f"{OLLAMA_BASE}/api/generate", json=payload, timeout=120)
     r.raise_for_status()
 
-    data = r.json()
-    text = data.get("response", "").strip()
-    return json.loads(text)
+    response = r.json().get("response", "")
+    return extract_json(response)
 
-def run(action: dict) -> None:
+def fast_rules(prompt: str) -> dict | None:
+    p = prompt.lower().strip()
+
+    if any(x in p for x in ["screenshot", "schermata", "cattura schermo", "cattura lo schermo"]):
+        mode = "full" if any(x in p for x in ["intero", "tutto", "full", "completo"]) else "area"
+        return {"action": "screenshot", "mode": mode}
+
+    if any(x in p for x in ["ferma registrazione", "stop registrazione", "smetti di registrare"]):
+        return {"action": "stop_audio_recording"}
+
+    if any(x in p for x in ["registra audio", "inizia a registrare", "avvia registrazione"]):
+        return {"action": "start_audio_recording"}
+
+    m = re.search(r"(?:cerca|googla|trova su internet|search)\s+(?:su google\s+)?(.+)", prompt, re.IGNORECASE)
+    if m:
+        return {"action": "web_search", "query": m.group(1).strip()}
+
+    if re.search(r"\bapri\s+firefox\b", p):
+        return {"action": "open_app", "app": "firefox"}
+
+    if re.search(r"\bapri\s+(terminale|terminal|foot)\b", p):
+        return {"action": "open_app", "app": "terminal"}
+
+    return None
+
+def execute(action: dict) -> str:
     name = action.get("action")
 
-    if name not in ACTIONS:
-        raise RuntimeError(f"Azione non consentita: {name}")
-
     if name == "open_app":
-        app = action.get("app", "")
-        allowed_apps = {
-            "firefox": ["firefox"],
-            "terminal": ["foot"],
-            "foot": ["foot"],
-        }
-
-        if app not in allowed_apps:
+        app = action.get("app", "").lower()
+        if app not in ALLOWED_APPS:
             raise RuntimeError(f"App non consentita: {app}")
-
-        subprocess.Popen(allowed_apps[app])
-        return
+        run_detached(ALLOWED_APPS[app])
+        return f"Aperto: {app}"
 
     if name == "web_search":
-        query = action.get("query", "")
+        query = action.get("query", "").strip()
+        if not query:
+            raise RuntimeError("Query vuota.")
         url = "https://www.google.com/search?q=" + urllib.parse.quote_plus(query)
-        subprocess.Popen(["firefox", url])
-        return
+        run_detached(["firefox", url])
+        return f"Ricerca: {query}"
 
     if name == "open_url":
-        url = action.get("url", "")
+        url = action.get("url", "").strip()
         if not url.startswith(("https://", "http://")):
-            raise RuntimeError("URL non valido")
-        subprocess.Popen(["firefox", url])
-        return
+            raise RuntimeError("URL non valido.")
+        run_detached(["firefox", url])
+        return f"Aperto URL: {url}"
 
     if name == "screenshot":
-        subprocess.run(
-            'grim -g "$(slurp)" "$HOME/Pictures/screenshot-$(date +%Y%m%d-%H%M%S).png"',
-            shell=True,
+        mode = action.get("mode", "area")
+        if mode not in {"area", "full"}:
+            mode = "area"
+        result = subprocess.run(
+            ["/usr/bin/ai-screenshot", mode],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             check=True,
         )
-        return
-
-    if name == "start_audio_recording":
-        subprocess.Popen([
-            "ffmpeg",
-            "-y",
-            "-f", "pulse",
-            "-i", "default",
-            f"{subprocess.os.path.expanduser('~/recording.wav')}"
-        ])
-        return
-
-    if name == "stop_audio_recording":
-        subprocess.run(["pkill", "-INT", "ffmpeg"], check=False)
-        return
+        return "Screenshot salvato."
 
     if name == "set_volume":
         level = int(action.get("level", 50))
         level = max(0, min(level, 100))
         subprocess.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{level}%"], check=True)
-        return
+        return f"Volume: {level}%"
+
+    if name == "start_audio_recording":
+        if RECORD_PID.exists():
+            return "Registrazione già attiva."
+
+        RECORD_DIR.mkdir(parents=True, exist_ok=True)
+        filename = RECORD_DIR / f"recording-{time.strftime('%Y%m%d-%H%M%S')}.wav"
+
+        if shutil.which("pw-record"):
+            proc = subprocess.Popen(["pw-record", str(filename)])
+        else:
+            proc = subprocess.Popen(["ffmpeg", "-y", "-f", "pulse", "-i", "default", str(filename)])
+
+        RECORD_PID.write_text(str(proc.pid))
+        return f"Registrazione avviata: {filename.name}"
+
+    if name == "stop_audio_recording":
+        if not RECORD_PID.exists():
+            return "Nessuna registrazione attiva."
+
+        pid = int(RECORD_PID.read_text().strip())
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+        RECORD_PID.unlink(missing_ok=True)
+        return "Registrazione fermata."
+
+    raise RuntimeError(f"Azione non consentita o non riconosciuta: {name}")
+
+def setup_model() -> None:
+    start_ollama_container()
+    ensure_model()
+    print(f"OK: modello {MODEL} pronto.")
 
 def main() -> None:
     if len(sys.argv) < 2:
-        print("Uso: ai-agent '<comando>'")
+        print("Uso: ai-agent '<comando>' oppure ai-agent --setup-model")
         sys.exit(1)
 
+    if sys.argv[1] == "--setup-model":
+        setup_model()
+        return
+
     user_prompt = " ".join(sys.argv[1:])
-    action = call_ollama(user_prompt)
-    run(action)
+
+    action = fast_rules(user_prompt)
+    if action is None:
+        action = call_llm(user_prompt)
+
+    result = execute(action)
+    print(result)
 
 if __name__ == "__main__":
     main()
